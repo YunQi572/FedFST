@@ -136,67 +136,73 @@ def get_Shigh(synthetic_data, args):
     num_nodes = node_features.shape[0]
     feature_dim = node_features.shape[1]
     
+    if args.use_gpu:
+        device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cpu")
+    node_features = node_features.to(device)
+    edge_index = edge_index.to(device)
+    
     edge_index_laplacian, edge_weight_laplacian = get_laplacian(
         edge_index, 
         num_nodes=num_nodes, 
         normalization=None
     )
-    
-    L = to_dense_adj(edge_index_laplacian, edge_attr=edge_weight_laplacian, max_num_nodes=num_nodes)[0]
-    if args.use_gpu:
-        device = torch.device(f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device("cpu")
-    L = L.to(device)
+    edge_index_laplacian = edge_index_laplacian.to(device)
+    edge_weight_laplacian = edge_weight_laplacian.to(device=device, dtype=node_features.dtype)
+
+    L_sparse = torch.sparse_coo_tensor(
+        edge_index_laplacian,
+        edge_weight_laplacian,
+        (num_nodes, num_nodes),
+        device=device
+    ).coalesce()
     
     num_selected_features = max(1, int(args.feature_prop * feature_dim))
-    print(f"选取的特征数量{num_selected_features}")
+    print(f"{num_selected_features}")
     
-    selected_feature_indices = torch.randperm(feature_dim)[:num_selected_features]
-    
-    S_high_x_i = []
-    
-    for feature_idx in selected_feature_indices:
-        x = node_features[:, feature_idx]
-        
-        xTLx = torch.matmul(torch.matmul(x.unsqueeze(0), L), x.unsqueeze(1)).squeeze()
-        xTx = torch.dot(x, x)
-        
-        if xTx > 1e-8:
-            S_high_i = xTLx / xTx
-            S_high_x_i.append(S_high_i)
-    
-    if len(S_high_x_i) > 0:
-        S_high_x = torch.stack(S_high_x_i).mean()
-    else:
-        S_high_x = torch.tensor(0.0, device=node_features.device)
-    
+    selected_feature_indices = torch.randperm(feature_dim, device=device)[:num_selected_features]
+    X = node_features[:, selected_feature_indices]
+    LX = torch.sparse.mm(L_sparse, X)
 
-    A = to_dense_adj(edge_index, max_num_nodes=num_nodes)[0].to(device)
-    
+    numerator_x = torch.sum(X * LX, dim=0)
+    denominator_x = torch.sum(X * X, dim=0)
+    valid_x = denominator_x > 1e-8
 
-    L_indices = edge_index_laplacian
-    L_values = edge_weight_laplacian
-    L_sparse = torch.sparse_coo_tensor(L_indices, L_values, (num_nodes, num_nodes)).to(synthetic_data.x.device)
-    
-    S_high_A_i = []
-    
-    for node_idx in range(num_nodes):
-        Ai = A[:, node_idx]
-        
-        L_Ai = torch.sparse.mm(L_sparse, Ai.unsqueeze(1)).squeeze()
-        
-        AiTLAi = torch.dot(Ai, L_Ai)
-        AiTAi = torch.dot(Ai, Ai)
-        
-        if AiTAi > 1e-8:
-            S_high_A_i_val = AiTLAi / AiTAi
-            S_high_A_i.append(S_high_A_i_val)
-    
-    if len(S_high_A_i) > 0:
-        S_high_A = torch.stack(S_high_A_i).mean()
+    if torch.any(valid_x):
+        S_high_x = torch.mean(numerator_x[valid_x] / denominator_x[valid_x])
     else:
-        S_high_A = torch.tensor(0.0, device=node_features.device)
+        S_high_x = torch.tensor(0.0, device=device, dtype=node_features.dtype)
+    
+    A_values = torch.ones(edge_index.shape[1], device=device, dtype=node_features.dtype)
+    A_sparse = torch.sparse_coo_tensor(
+        edge_index,
+        A_values,
+        (num_nodes, num_nodes),
+        device=device
+    ).coalesce()
+
+    LA_sparse = torch.sparse.mm(L_sparse, A_sparse).coalesce()
+    LA_on_A = LA_sparse.sparse_mask(A_sparse).coalesce()
+    A_on_LA = A_sparse.sparse_mask(LA_on_A).coalesce()
+
+    A_idx = A_sparse.indices()
+    A_val = A_sparse.values()
+    LA_idx = LA_on_A.indices()
+    LA_val = LA_on_A.values()
+    A_on_LA_val = A_on_LA.values()
+
+    numerator_A = torch.zeros(num_nodes, device=device, dtype=node_features.dtype)
+    denominator_A = torch.zeros(num_nodes, device=device, dtype=node_features.dtype)
+
+    numerator_A.scatter_add_(0, LA_idx[1], A_on_LA_val * LA_val)
+    denominator_A.scatter_add_(0, A_idx[1], A_val * A_val)
+    valid_A = denominator_A > 1e-8
+
+    if torch.any(valid_A):
+        S_high_A = torch.mean(numerator_A[valid_A] / denominator_A[valid_A])
+    else:
+        S_high_A = torch.tensor(0.0, device=device, dtype=node_features.dtype)
     
     S_high_x_weight = args.S_high_x_weight
     S_high_A_weight = args.S_high_A_weight
